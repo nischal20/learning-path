@@ -1,4 +1,57 @@
-PostgreSQL pg_advisory_lock Explained
+# PostgreSQL Advisory Locks
 
-What is pg_advisory_lock?
-pg_advisory_lock is a PostgreSQL built-in function that provides application-level locking. Unlike standard PostgreSQL locks that automatically protect tables and rows, advisory locks are explicitly controlled by your application code.
+> A concise guide to distributed coordination using PostgreSQL advisory locks.
+
+## Overview
+
+PostgreSQL advisory locks provide application-level coordination across distributed systems without locking database rows/tables.
+
+## Types
+
+| Lock Function | Scope | Behavior |
+|---------------|-------|----------|
+| `pg_advisory_lock()` | Session | Blocks until acquired |
+| `pg_advisory_xact_lock()` | Transaction | Auto-released at txn end |
+| `pg_try_advisory_lock()` | Session | Non-blocking, returns success/failure |
+| `pg_advisory_unlock()` | Session | Explicitly releases lock |
+
+## Usage Patterns
+
+```sql
+-- Acquire lock (blocks until available)
+SELECT pg_advisory_lock(hashid);
+
+-- Try to acquire (non-blocking)
+SELECT pg_try_advisory_lock(hashid);
+
+-- Release lock
+SELECT pg_advisory_unlock(hashid);
+
+-- Check if lock is held by any session
+SELECT objid, granted FROM pg_locks WHERE locktype = 'advisory';
+```
+
+## Best Practices
+
+- **Lock IDs**: Use consistent hash functions for string keys
+- **Error Handling**: Implement timeouts and connection failure recovery
+- **Session Awareness**: Remember locks are tied to database connections
+- **Cleanup**: Always release locks, even during exceptions
+- **Monitoring**: Track lock acquisition times and contention
+
+## Common Use Cases
+
+- Distributed mutex across multiple pods/services
+- Preventing duplicate job processing
+- Coordinated cron jobs (singleton execution)
+- Throttling concurrent operations
+
+## Limitations
+
+- Bound to PostgreSQL's availability
+- Not designed for ultra-high-frequency locking
+- Potential for deadlocks without proper timeout management
+
+---
+
+*A solid understanding of PostgreSQL advisory locks is essential for robust distributed systems architecture.*
