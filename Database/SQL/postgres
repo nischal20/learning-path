@@ -1,0 +1,4 @@
+PostgreSQL pg_advisory_lock Explained
+
+What is pg_advisory_lock?
+pg_advisory_lock is a PostgreSQL built-in function that provides application-level locking. Unlike standard PostgreSQL locks that automatically protect tables and rows, advisory locks are explicitly controlled by your application code.
