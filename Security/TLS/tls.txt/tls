@@ -1,0 +1,20 @@
+TLS stands for "Transport Layer Security." TLS 1.2 is a specific version of this security protocol.
+
+In TLS 1.2, there are several types of "keys" involved in the security process:
+
+Certificates: These are digital documents that verify the identity of a website. They're like ID cards for websites that prove they are who they claim to be. The certificate contains the website's public key.
+Public and Private Keys:
+
+The public key is shared openly and used to encrypt information
+The private key is kept secret by the server and used to decrypt information that was encrypted with the public key
+
+
+Browser TLS 1.2 Enforcement Guide
+Important Note
+This implementation is primarily handled on the server/DevOps side through Nginx, Apache, or cloud configuration. Application developers typically don't need to modify their code to enforce TLS versions.
+Server Configuration (DevOps responsibility)
+
+Nginx: Set ssl_protocols TLSv1.2 TLSv1.3
+Apache: Use SSLProtocol -all +TLSv1.2 +TLSv1.3
+AWS Services: Configure security policies to require TLS 1.2+
+Add HSTS header: Strict-Transport-Security: max-age=31536000
