@@ -55,3 +55,53 @@ SELECT objid, granted FROM pg_locks WHERE locktype = 'advisory';
 ---
 
 *A solid understanding of PostgreSQL advisory locks is essential for robust distributed systems architecture.*
+
+
+
+
+Pitfall
+The Pitfall of Using PostgreSQL Advisory Locks with Go's DB Connection Pool
+We have a problem!
+Imagine for a moment that you have a microservice written in the Go Programming Language that is deployed on more than one instance for reliabilty and performance reasons. They all share the same underlying PostgreSQL database. Perhaps you then want to limit certain functionality to only one instance at a time (e.g. background worker, queue consumption). To achieve this synchronization, you decide to use PostgreSQL session-level advisory locks. You initialize a session-level advisory lock, pass it to the concerned functionality and then wrap it with a lock and unlock on the session-level advisory lock.
+
+So far, things sound good. Only one instance enters the critical section. All other instances are blocked from entering the critical section till the first instance leaves it. However, it turns out that once the first instance unlocks the session-level advisory lock and leaves the critical section, no instance (including the first instance) can enter the critical section again. They all block when acquiring the advisory lock.
+
+Sometimes, the critical section can be entered for a second time, and sometimes even for three or more times. But finally the end result is the same. Sooner or later, all instances block on acquiring the session-level advisory lock and none can enter the synchronized portion of code forever.
+
+The offending code…
+This is the situation we found ourselves in. We went through our code. Locking and unlocking a pg_advisory_lock was done like below:
+
+Locking
+1
+2
+db, _ := sql.Open("postgres", _<url>_)
+db.Exec(`SELECT pg_advisory_lock($1)`, <a session id>)
+Unlocking
+1
+db.Exec(`SELECT pg_advisory_unlock($1)`, <the same session id>)
+Finding the culprit!
+After consulting our in-house expert and digging a little deeper, we discovered a couple of facts:
+
+Session-level pg_advisory_locks can only be released in the same database connection in which it was obtained. For more details, see here.
+Go’s standard library sql package creates a pool of database connections by default. See here. Each DB call is done on an arbitrary connection from the DB pool.
+So deducing from the above, the DB connection pool must not be returning the same connection for the unlock that was used for the lock. So how do we enforce that the lock and the unlock are done on the same connection? It turns out that a single connection can be obtained from and released to the DB pool.
+
+The right solution.
+The proper way to lock and unlock session-level pg_advisory_locks is to first obtain a connection from the DB connection pool and store it and use it for both operations.
+
+Locking
+1
+2
+3
+db, _ := sql.Open("postgres", _<url>_)
+conn, _err_ := db.Conn(context.Background())
+conn.ExecContext(context.Background(), `SELECT pg_advisory_lock($1)`, <a session id>)
+Unlocking
+1
+2
+conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, <the same session id>)
+conn.Close()
+The size of the DB connection pool should be increased appropriately to compensate for the connections that are permanently taken away to be used in this way.
+
+Conclusion
+Moral of the story: Always unlock a PostgreSQL session-level advisory lock on the same connection which was used to lock it, otherwise sooner or later, you will end up not unlocking it, and then you will be blocked forever. Fortunately, this kind of problem will show up in your face immediately rather than later. Unfortunately, the solution is not straightforward, but a little subtle. Hopefully, instead of rolling back the changes and avoiding or limiting the use of PostgreSQL session-level advisory locks, this post will help you solve the problem correctly.
