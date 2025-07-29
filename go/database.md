@@ -1,0 +1,1 @@
+- [ ] Always include LIMIT when using WHERE clauses with optional parameters to prevent full table dumps
