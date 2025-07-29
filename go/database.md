@@ -1,1 +1,7 @@
 - [ ] Always include LIMIT when using WHERE clauses with optional parameters to prevent full table dumps
+- [ ] Always check if database connections are closed by library or manually close to prevent connection pool exhaustion
+- [ ] **NEVER use string concatenation for SQL queries - always use parameterized queries to prevent SQL injection**
+- [ ] Use prepared statements with placeholder parameters (?, $1, etc.) for all dynamic values
+- [ ] Validate and sanitize all input parameters before query building
+- [ ] Pre-allocate slices with expected capacity when possible
+- [ ] Use fmt.Errorf with %w verb to wrap errors for better error chains
