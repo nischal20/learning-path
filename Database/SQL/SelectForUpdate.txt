@@ -1,36 +1,462 @@
-https://dev.to/jacktt/understanding-the-select-for-update-sql-statement-900
+# PostgreSQL Row Locking Guide for Distributed Systems
 
+## 🎯 Overview
 
-What is "SELECT FOR UPDATE"?
-SELECT FOR UPDATE is a clause in SQL that is appended to a SELECT statement. It locks the selected rows, preventing other transactions from modifying them until the current transaction is committed or rolled back. This ensures that the data being read and potentially updated remains consistent throughout the transaction.
+This guide explains PostgreSQL's `FOR UPDATE SKIP LOCKED` pattern for building distributed work queues that prevent race conditions between multiple processes.
 
-How Does "SELECT FOR UPDATE" Work?
-When a transaction issues a "SELECT FOR UPDATE" statement, the following steps occur:
+## 🔑 Core Principles
 
-Row Selection: The database engine identifies the rows that match the specified condition.
-Row Locking: The selected rows are locked, preventing other transactions from acquiring locks that would conflict with the current transaction. This typically means other transactions cannot update or delete these rows until the lock is released. The affected transactions include:
-UPDATE
-DELETE
-SELECT FOR UPDATE
-SELECT FOR NO KEY UPDATE
-SELECT FOR SHARE
-SELECT FOR KEY SHARE
-That means the read only queries (SELECT) are not locked.
+### 1. Transaction is MANDATORY ⚠️
 
-Data Access: The transaction can read and potentially update the locked rows.
-Transaction Completion: Once the transaction is committed or rolled back, the locks are released, making the rows available for other transactions.
-Postgres: Row-level locks do not affect data querying; they block only writers and lockers to the same row. (https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS)
+Without a transaction, `FOR UPDATE SKIP LOCKED` is **useless** for distributed systems:
 
-Benefits of Using "SELECT FOR UPDATE"
-Data Consistency: By locking the rows during a transaction, "SELECT FOR UPDATE" ensures that the data being read is not changed by other transactions, maintaining consistency.
-Avoiding Deadlocks: Proper use of "SELECT FOR UPDATE" can help avoid deadlocks by managing locks in a controlled manner.
-Concurrency Control: It provides a way to handle concurrent data access and modification efficiently, particularly in applications with high transaction volumes.
-Use Cases of "SELECT FOR UPDATE"
-Banking Systems: Ensuring that account balances are accurate by locking rows representing accounts during transactions.
-Inventory Management: Preventing the same item from being sold to multiple customers simultaneously by locking the inventory records.
-Reservation Systems: Managing bookings by locking the rows representing available slots or seats during the reservation process.
-Conclusion
-"SELECT FOR UPDATE" is a vital tool for managing data integrity and consistency in relational databases. By understanding its functionality and applying it thoughtfully, developers can handle concurrent transactions effectively, ensuring reliable and accurate data manipulation. However, it is equally important to be aware of its implications on performance and system architecture to make the best use of this feature.
+```sql
+-- ❌ BAD: Without transaction
+SELECT * FROM work_queue FOR UPDATE SKIP LOCKED;
+-- Locks are immediately released after query completes (auto-commit)
+-- Other processes can grab the same rows!
+```
 
-References
-https://www.postgresql.org/docs/current/explicit-locking.html
+```sql
+-- ✅ GOOD: With transaction  
+BEGIN;
+SELECT * FROM work_queue FOR UPDATE SKIP LOCKED;
+-- Locks held until COMMIT/ROLLBACK
+-- Other processes are blocked from these rows
+COMMIT;
+```
+
+### 2. Locks are ROW-LEVEL, Not Column-Level 🔒
+
+The lock applies to the **entire row**, regardless of which columns you select:
+
+```sql
+-- All these lock the SAME entire row (id=1):
+SELECT * FROM table WHERE id=1 FOR UPDATE;
+SELECT column1 FROM table WHERE id=1 FOR UPDATE; 
+SELECT COUNT(*) FROM table WHERE id=1 FOR UPDATE;
+```
+
+### 3. Reads ALLOWED, Writes BLOCKED 📖
+
+**✅ ALLOWED on locked rows (any process):**
+```sql
+SELECT * FROM table WHERE id=1;                    -- Regular reads
+SELECT specific_column FROM table WHERE id=1;      -- Column reads
+SELECT COUNT(*) FROM table WHERE status='NEW';     -- Aggregations
+```
+
+**❌ BLOCKED/SKIPPED on locked rows:**
+```sql
+SELECT * FROM table WHERE id=1 FOR UPDATE;                -- Lock attempts (blocked)
+SELECT * FROM table WHERE id=1 FOR UPDATE SKIP LOCKED;    -- Lock attempts (skipped)
+SELECT * FROM table WHERE id=1 FOR SHARE;                 -- Shared locks (blocked)
+UPDATE table SET status='DONE' WHERE id=1;                -- Modifications (blocked)
+DELETE FROM table WHERE id=1;                             -- Deletions (blocked)
+```
+
+## 🏗️ Distributed Work Queue Pattern
+
+### The Problem
+Multiple processes trying to process the same work items simultaneously:
+
+```
+Process A                    Process B
+┌─────────────────┐         ┌─────────────────┐
+│ Get work item 1 │────────▶│ Get work item 1 │ ❌ RACE CONDITION!
+│ Process item 1  │         │ Process item 1  │ ❌ DUPLICATE WORK!
+└─────────────────┘         └─────────────────┘
+```
+
+### The Solution
+Use `FOR UPDATE SKIP LOCKED` within transactions:
+
+```
+Process A                           Process B
+┌─────────────────────────┐        ┌─────────────────────────┐
+│ BEGIN                   │        │ BEGIN                   │
+│ SELECT ... FOR UPDATE   │        │ SELECT ... FOR UPDATE   │
+│ SKIP LOCKED             │        │ SKIP LOCKED             │
+│ → Gets items 1,2,3      │        │ → Gets items 4,5,6      │ ✅ Different items!
+│ Process items 1,2,3     │        │ Process items 4,5,6     │ ✅ No conflicts!
+│ UPDATE ... SET status   │        │ UPDATE ... SET status   │
+│ COMMIT                  │        │ COMMIT                  │
+└─────────────────────────┘        └─────────────────────────┘
+```
+
+## 💻 Go Implementation Example
+
+### Complete Working Example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    
+    "github.com/jmoiron/sqlx"
+    _ "github.com/lib/pq"
+)
+
+type WorkItem struct {
+    ID            int    `db:"id"`
+    RequestSeqNo  string `db:"request_sequence_no"`
+    Status        string `db:"status"`
+    Data          string `db:"data"`
+}
+
+// GetWorkWithLock demonstrates the proper pattern for distributed work processing
+func GetWorkWithLock(ctx context.Context, tx *sqlx.Tx, limit int) ([]WorkItem, error) {
+    // Step 1: Lock available work items
+    lockQuery := `
+        SELECT id, request_sequence_no 
+        FROM work_queue 
+        WHERE status = 'NEW' 
+        ORDER BY created_at ASC 
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+    `
+    
+    var lockedIDs []int
+    rows, err := tx.QueryxContext(ctx, lockQuery, limit)
+    if err != nil {
+        return nil, fmt.Errorf("failed to lock work items: %w", err)
+    }
+    defer rows.Close()
+    
+    for rows.Next() {
+        var id int
+        var seqNo string
+        if err := rows.Scan(&id, &seqNo); err != nil {
+            return nil, fmt.Errorf("failed to scan locked item: %w", err)
+        }
+        lockedIDs = append(lockedIDs, id)
+    }
+    
+    if len(lockedIDs) == 0 {
+        return []WorkItem{}, nil // No work available
+    }
+    
+    // Step 2: Get full data for locked items (same transaction)
+    dataQuery := `
+        SELECT id, request_sequence_no, status, data
+        FROM work_queue 
+        WHERE id = ANY($1)
+    `
+    
+    var workItems []WorkItem
+    if err := tx.SelectContext(ctx, &workItems, dataQuery, lockedIDs); err != nil {
+        return nil, fmt.Errorf("failed to fetch work item data: %w", err)
+    }
+    
+    return workItems, nil
+}
+
+// ProcessWorkItems handles the complete workflow
+func ProcessWorkItems(ctx context.Context, db *sqlx.DB) error {
+    // Start transaction - CRITICAL for maintaining locks
+    tx, err := db.BeginTxx(ctx, nil)
+    if err != nil {
+        return fmt.Errorf("failed to begin transaction: %w", err)
+    }
+    defer tx.Rollback() // Cleanup on error
+    
+    // Get work items with locks
+    workItems, err := GetWorkWithLock(ctx, tx, 10)
+    if err != nil {
+        return fmt.Errorf("failed to get work: %w", err)
+    }
+    
+    if len(workItems) == 0 {
+        log.Println("No work available")
+        return tx.Commit() // Commit empty transaction
+    }
+    
+    // Process each item
+    var processedIDs []int
+    for _, item := range workItems {
+        // Your business logic here
+        log.Printf("Processing item %d: %s", item.ID, item.RequestSeqNo)
+        
+        // Simulate processing
+        if err := processItem(item); err != nil {
+            log.Printf("Failed to process item %d: %v", item.ID, err)
+            continue // Skip failed items
+        }
+        
+        processedIDs = append(processedIDs, item.ID)
+    }
+    
+    // Update status for successfully processed items
+    if len(processedIDs) > 0 {
+        updateQuery := `
+            UPDATE work_queue 
+            SET status = 'COMPLETED', updated_at = NOW() 
+            WHERE id = ANY($1)
+        `
+        if _, err := tx.ExecContext(ctx, updateQuery, processedIDs); err != nil {
+            return fmt.Errorf("failed to update processed items: %w", err)
+        }
+    }
+    
+    // Commit transaction - releases all locks
+    if err := tx.Commit(); err != nil {
+        return fmt.Errorf("failed to commit transaction: %w", err)
+    }
+    
+    log.Printf("Successfully processed %d items", len(processedIDs))
+    return nil
+}
+
+func processItem(item WorkItem) error {
+    // Your business logic implementation
+    // This could be API calls, data transformations, etc.
+    return nil
+}
+
+// Example usage in a worker service
+func main() {
+    ctx := context.Background()
+    
+    // Database connection
+    db, err := sqlx.Connect("postgres", "your-connection-string")
+    if err != nil {
+        log.Fatal("Database connection failed:", err)
+    }
+    defer db.Close()
+    
+    // Process work in a loop (typical worker pattern)
+    for {
+        if err := ProcessWorkItems(ctx, db); err != nil {
+            log.Printf("Work processing failed: %v", err)
+            // Add backoff/retry logic here
+        }
+        
+        // Sleep before next iteration
+        // time.Sleep(5 * time.Second)
+    }
+}
+```
+
+### Alternative: Single Query Approach
+
+For better performance, you can combine both queries:
+
+```go
+func GetWorkWithLockSingleQuery(ctx context.Context, tx *sqlx.Tx, limit int) ([]WorkItem, error) {
+    query := `
+        SELECT id, request_sequence_no, status, data
+        FROM work_queue 
+        WHERE status = 'NEW' 
+        ORDER BY created_at ASC 
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+    `
+    
+    var workItems []WorkItem
+    if err := tx.SelectContext(ctx, &workItems, query, limit); err != nil {
+        return nil, fmt.Errorf("failed to get and lock work items: %w", err)
+    }
+    
+    return workItems, nil
+}
+```
+
+## 📊 Database Schema Example
+
+```sql
+CREATE TABLE work_queue (
+    id SERIAL PRIMARY KEY,
+    request_sequence_no VARCHAR(50) UNIQUE NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'NEW',
+    data JSONB,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    processed_by VARCHAR(50),
+    
+    -- Indexes for performance
+    INDEX idx_work_queue_status_created (status, created_at),
+    INDEX idx_work_queue_seq_no (request_sequence_no)
+);
+
+-- Sample data
+INSERT INTO work_queue (request_sequence_no, data) VALUES
+('SEQ001', '{"type": "payment", "amount": 100}'),
+('SEQ002', '{"type": "transfer", "amount": 250}'),
+('SEQ003', '{"type": "payment", "amount": 75}');
+```
+
+## 🔍 What Happens During Concurrent Access
+
+### Scenario: 2 Processes Running Simultaneously
+
+```sql
+-- Process A (Transaction 1)
+BEGIN;
+SELECT id FROM work_queue WHERE status = 'NEW' ORDER BY created_at ASC LIMIT 3 FOR UPDATE SKIP LOCKED;
+-- Result: Gets IDs [1, 2, 3] and locks these rows
+
+-- Process B (Transaction 2) - Running at the same time
+BEGIN;  
+SELECT id FROM work_queue WHERE status = 'NEW' ORDER BY created_at ASC LIMIT 3 FOR UPDATE SKIP LOCKED;
+-- Result: SKIPS rows [1, 2, 3], gets IDs [4, 5, 6]
+
+-- Both processes can now safely work with their respective rows
+-- Process A works with rows 1,2,3
+-- Process B works with rows 4,5,6
+-- No conflicts!
+```
+
+### What Other Processes Can Do
+
+```sql
+-- ✅ Monitoring queries (different connection) - ALLOWED
+SELECT COUNT(*) FROM work_queue WHERE status = 'NEW';
+SELECT * FROM work_queue WHERE id = 1;  -- Can read locked rows
+
+-- ❌ Competing work queries - BLOCKED/SKIPPED  
+SELECT * FROM work_queue WHERE id = 1 FOR UPDATE;  -- Blocked until Process A commits
+SELECT * FROM work_queue WHERE status = 'NEW' FOR UPDATE SKIP LOCKED;  -- Skips locked rows
+```
+
+## 🚨 Common Pitfalls
+
+### 1. Forgetting Transaction Context
+```go
+// ❌ BAD: Using db instead of tx for second query
+func BadExample(ctx context.Context, db *sqlx.DB) {
+    tx, _ := db.BeginTxx(ctx, nil)
+    
+    // Lock rows in transaction
+    tx.QueryxContext(ctx, "SELECT ... FOR UPDATE SKIP LOCKED")
+    
+    // Query outside transaction - WRONG!
+    db.QueryxContext(ctx, "SELECT ... WHERE id IN (...)")  // No lock protection!
+    
+    tx.Commit()
+}
+
+// ✅ GOOD: Both queries use same transaction
+func GoodExample(ctx context.Context, db *sqlx.DB) {
+    tx, _ := db.BeginTxx(ctx, nil)
+    
+    // Lock rows
+    tx.QueryxContext(ctx, "SELECT ... FOR UPDATE SKIP LOCKED") 
+    
+    // Query with same transaction - protected by locks
+    tx.QueryxContext(ctx, "SELECT ... WHERE id IN (...)")
+    
+    tx.Commit()
+}
+```
+
+### 2. Not Handling Empty Results
+```go
+// ✅ Always check for empty results
+workItems, err := GetWorkWithLock(ctx, tx, 10)
+if err != nil {
+    return err
+}
+
+if len(workItems) == 0 {
+    log.Println("No work available")
+    return tx.Commit() // Don't forget to commit empty transactions
+}
+```
+
+### 3. Long-Running Transactions
+```go
+// ❌ BAD: Holding locks too long
+tx, _ := db.BeginTxx(ctx, nil)
+workItems, _ := GetWorkWithLock(ctx, tx, 100)
+
+// Don't do expensive operations while holding locks
+time.Sleep(10 * time.Minute)  // Other processes blocked!
+callSlowAPI()                 // Other processes blocked!
+
+tx.Commit()
+
+// ✅ GOOD: Keep transactions short
+tx, _ := db.BeginTxx(ctx, nil)
+workItems, _ := GetWorkWithLock(ctx, tx, 100)
+// Update status to 'PROCESSING' quickly
+updateStatusQuery := "UPDATE work_queue SET status = 'PROCESSING' WHERE id = ANY($1)"
+tx.ExecContext(ctx, updateStatusQuery, workItemIDs)
+tx.Commit() // Release locks quickly
+
+// Do expensive work outside transaction
+for _, item := range workItems {
+    processItem(item)  // No locks held
+}
+
+// Update final status in separate transaction
+finalTx, _ := db.BeginTxx(ctx, nil)
+updateFinalQuery := "UPDATE work_queue SET status = 'COMPLETED' WHERE id = ANY($1)"
+finalTx.ExecContext(ctx, updateFinalQuery, processedIDs)
+finalTx.Commit()
+```
+
+## 🎛️ Performance Considerations
+
+### 1. Limit Batch Size
+```go
+// Don't grab too many items at once
+const BATCH_SIZE = 10  // Reasonable batch size
+
+workItems, err := GetWorkWithLock(ctx, tx, BATCH_SIZE)
+```
+
+### 2. Add Proper Indexes
+```sql
+-- Critical for performance
+CREATE INDEX idx_work_queue_status_created ON work_queue(status, created_at);
+```
+
+### 3. Monitor Lock Contention
+```sql
+-- Check for blocked queries
+SELECT 
+    blocked_locks.pid AS blocked_pid,
+    blocked_activity.usename AS blocked_user,
+    blocking_locks.pid AS blocking_pid,
+    blocking_activity.usename AS blocking_user,
+    blocked_activity.query AS blocked_statement,
+    blocking_activity.query AS blocking_statement
+FROM pg_catalog.pg_locks blocked_locks
+JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+JOIN pg_catalog.pg_locks blocking_locks ON blocking_locks.locktype = blocked_locks.locktype
+    AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+    AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+    AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+    AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+    AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+    AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+    AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+    AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+    AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+    AND blocking_locks.pid != blocked_locks.pid
+JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+WHERE NOT blocked_locks.granted;
+```
+
+## 📚 Key Takeaways
+
+1. **Transaction Mandatory**: `FOR UPDATE SKIP LOCKED` without transaction = useless
+2. **Row-Level Locking**: Entire row is locked, not individual columns  
+3. **Read vs Write**: Regular SELECTs allowed, lock acquisition and modifications blocked
+4. **Perfect for Work Queues**: Each worker gets different items, no race conditions
+5. **Keep Transactions Short**: Don't hold locks longer than necessary
+6. **Handle Empty Results**: Always check if work is available
+7. **Monitor Performance**: Use proper indexes and watch for contention
+
+## 🔗 Additional Resources
+
+- [PostgreSQL Official Documentation - Row Locking](https://www.postgresql.org/docs/current/explicit-locking.html)
+- [PostgreSQL SELECT FOR UPDATE](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)
+- [Building Reliable Work Queues with PostgreSQL](https://brandur.org/job-drain)
+
+---
+
+*This guide is optimized for distributed systems where multiple processes need to coordinate work without conflicts. The patterns shown here prevent race conditions and ensure data consistency across concurrent operations.*
