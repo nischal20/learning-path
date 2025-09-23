@@ -1,0 +1,1 @@
+https://dev.to/jacktt/understanding-the-select-for-update-sql-statement-900
